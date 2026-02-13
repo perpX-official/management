@@ -16,6 +16,51 @@ const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET || "";
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 
+function normalizeOrigin(url: string): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return null;
+  }
+}
+
+function getAllowedFrontendOrigins(): string[] {
+  const allowed = new Set<string>();
+
+  const explicitFrontend = normalizeOrigin(process.env.FRONTEND_BASE_URL || "");
+  if (explicitFrontend) allowed.add(explicitFrontend);
+
+  const corsOrigins = (process.env.CORS_ORIGIN || "")
+    .split(",")
+    .map((v) => normalizeOrigin(v.trim()))
+    .filter((v): v is string => !!v);
+  for (const origin of corsOrigins) allowed.add(origin);
+
+  return Array.from(allowed);
+}
+
+function resolveFrontendOrigin(req: Request, requestedOrigin?: string): string {
+  const normalizedRequested = normalizeOrigin(requestedOrigin || "");
+  const allowed = getAllowedFrontendOrigins();
+
+  if (normalizedRequested && (allowed.length === 0 || allowed.includes(normalizedRequested))) {
+    return normalizedRequested;
+  }
+
+  if (allowed.length > 0) {
+    return allowed[0];
+  }
+
+  return getBaseUrl(req);
+}
+
+function makeRewardsRedirect(frontendOrigin: string, params: Record<string, string>): string {
+  const query = new URLSearchParams(params).toString();
+  return `${frontendOrigin}/rewards${query ? `?${query}` : ""}`;
+}
+
 /**
  * Get the base URL for OAuth callbacks
  * 
@@ -26,9 +71,10 @@ const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
  * 4. Default localhost for development
  * 
  * IMPORTANT: When deploying to Vercel with custom domain:
- * - Set OAUTH_CALLBACK_BASE_URL to your custom domain (e.g., https://perpx.fi)
- * - Update X Developer Portal redirect URI to: https://perpx.fi/api/social/x/callback
- * - Update Discord Developer Portal redirect URI to: https://perpx.fi/api/social/discord/callback
+ * - Set OAUTH_CALLBACK_BASE_URL to backend domain (e.g., https://api.perpx.fi)
+ * - Set FRONTEND_BASE_URL to frontend domain (e.g., https://perpx.fi)
+ * - Update X Developer Portal redirect URI to: https://api.perpx.fi/api/social/x/callback
+ * - Update Discord Developer Portal redirect URI to: https://api.perpx.fi/api/social/discord/callback
  */
 function getBaseUrl(req: Request): string {
   // 1. Explicit override (recommended for production with custom domain)
@@ -68,6 +114,7 @@ function getBaseUrl(req: Request): string {
 const pendingOAuthStates = new Map<string, { 
   walletAddress: string; 
   codeVerifier: string;
+  frontendOrigin: string;
   createdAt: number;
 }>();
 
@@ -108,6 +155,7 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
  */
 router.get("/x/auth", async (req: Request, res: Response) => {
   const walletAddress = req.query.wallet as string;
+  const requestedOrigin = (req.query.redirect as string) || "";
   
   if (!walletAddress) {
     return res.status(400).json({ error: "Wallet address required" });
@@ -125,6 +173,7 @@ router.get("/x/auth", async (req: Request, res: Response) => {
   pendingOAuthStates.set(state, {
     walletAddress,
     codeVerifier,
+    frontendOrigin: resolveFrontendOrigin(req, requestedOrigin),
     createdAt: Date.now(),
   });
 
@@ -150,21 +199,23 @@ router.get("/x/auth", async (req: Request, res: Response) => {
  */
 router.get("/x/callback", async (req: Request, res: Response) => {
   const { code, state, error } = req.query;
+  const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
   if (error) {
-    return res.redirect(`/rewards?error=x_auth_denied`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_denied" }));
   }
 
   if (!code || !state) {
-    return res.redirect(`/rewards?error=x_auth_invalid`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_invalid" }));
   }
 
   const pendingState = pendingOAuthStates.get(state as string);
   if (!pendingState) {
-    return res.redirect(`/rewards?error=x_auth_expired`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_expired" }));
   }
 
   pendingOAuthStates.delete(state as string);
+  const frontendOrigin = pendingState.frontendOrigin || defaultFrontendOrigin;
 
   try {
     const baseUrl = getBaseUrl(req);
@@ -187,7 +238,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
 
     if (!tokenResponse.ok) {
       console.error("X token exchange failed:", await tokenResponse.text());
-      return res.redirect(`/rewards?error=x_token_failed`);
+      return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_token_failed" }));
     }
 
     const tokenData = await tokenResponse.json();
@@ -202,7 +253,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
 
     if (!userResponse.ok) {
       console.error("X user fetch failed:", await userResponse.text());
-      return res.redirect(`/rewards?error=x_user_failed`);
+      return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_user_failed" }));
     }
 
     const userData = await userResponse.json();
@@ -212,13 +263,13 @@ router.get("/x/callback", async (req: Request, res: Response) => {
     const result = await connectXAccount(pendingState.walletAddress, xUsername);
 
     if (result.success) {
-      res.redirect(`/rewards?success=x_connected&username=${xUsername}`);
+      res.redirect(makeRewardsRedirect(frontendOrigin, { success: "x_connected", username: xUsername }));
     } else {
-      res.redirect(`/rewards?error=x_already_connected`);
+      res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_already_connected" }));
     }
   } catch (err) {
     console.error("X OAuth error:", err);
-    res.redirect(`/rewards?error=x_auth_error`);
+    res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_auth_error" }));
   }
 });
 
@@ -228,6 +279,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
 
 const pendingDiscordStates = new Map<string, {
   walletAddress: string;
+  frontendOrigin: string;
   createdAt: number;
 }>();
 
@@ -247,6 +299,7 @@ setInterval(() => {
  */
 router.get("/discord/auth", async (req: Request, res: Response) => {
   const walletAddress = req.query.wallet as string;
+  const requestedOrigin = (req.query.redirect as string) || "";
 
   if (!walletAddress) {
     return res.status(400).json({ error: "Wallet address required" });
@@ -260,6 +313,7 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
 
   pendingDiscordStates.set(state, {
     walletAddress,
+    frontendOrigin: resolveFrontendOrigin(req, requestedOrigin),
     createdAt: Date.now(),
   });
 
@@ -283,21 +337,23 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
  */
 router.get("/discord/callback", async (req: Request, res: Response) => {
   const { code, state, error } = req.query;
+  const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
   if (error) {
-    return res.redirect(`/rewards?error=discord_auth_denied`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_denied" }));
   }
 
   if (!code || !state) {
-    return res.redirect(`/rewards?error=discord_auth_invalid`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_invalid" }));
   }
 
   const pendingState = pendingDiscordStates.get(state as string);
   if (!pendingState) {
-    return res.redirect(`/rewards?error=discord_auth_expired`);
+    return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_expired" }));
   }
 
   pendingDiscordStates.delete(state as string);
+  const frontendOrigin = pendingState.frontendOrigin || defaultFrontendOrigin;
 
   try {
     const baseUrl = getBaseUrl(req);
@@ -320,7 +376,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
 
     if (!tokenResponse.ok) {
       console.error("Discord token exchange failed:", await tokenResponse.text());
-      return res.redirect(`/rewards?error=discord_token_failed`);
+      return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_token_failed" }));
     }
 
     const tokenData = await tokenResponse.json();
@@ -335,7 +391,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
 
     if (!userResponse.ok) {
       console.error("Discord user fetch failed:", await userResponse.text());
-      return res.redirect(`/rewards?error=discord_user_failed`);
+      return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_user_failed" }));
     }
 
     const userData = await userResponse.json();
@@ -346,13 +402,13 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
     const result = await connectDiscordAccount(pendingState.walletAddress, discordUsername, discordId);
 
     if (result.success) {
-      res.redirect(`/rewards?success=discord_connected&username=${discordUsername}`);
+      res.redirect(makeRewardsRedirect(frontendOrigin, { success: "discord_connected", username: discordUsername }));
     } else {
-      res.redirect(`/rewards?error=discord_already_connected`);
+      res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_already_connected" }));
     }
   } catch (err) {
     console.error("Discord OAuth error:", err);
-    res.redirect(`/rewards?error=discord_auth_error`);
+    res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_auth_error" }));
   }
 });
 
