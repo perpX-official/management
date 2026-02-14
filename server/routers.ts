@@ -1,6 +1,7 @@
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
+import type { TrpcContext } from "./_core/context";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import { mockRewardsRouter, mockReferralRouter, mockAdminRouter } from "./mockRouters";
@@ -39,6 +40,96 @@ import {
 } from "./db";
 
 const useMock = process.env.REWARDS_MOCK === "1";
+const REWARDS_IDENTITY_COOKIE = "perpx_rewards_wallet";
+const REWARDS_IDENTITY_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
+
+function normalizeWalletAddress(value?: string | null): string | null {
+  const normalized = (value || "").trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function parseCookieValue(cookieHeader: string, key: string): string | null {
+  const pairs = cookieHeader.split(";");
+  for (const pair of pairs) {
+    const idx = pair.indexOf("=");
+    if (idx < 0) continue;
+    const cookieKey = pair.slice(0, idx).trim();
+    if (cookieKey !== key) continue;
+    const cookieValue = pair.slice(idx + 1).trim();
+    try {
+      return decodeURIComponent(cookieValue);
+    } catch {
+      return cookieValue;
+    }
+  }
+  return null;
+}
+
+function getRewardsCookieDomain(hostHeader?: string): string | undefined {
+  if (!hostHeader) return undefined;
+  const host = hostHeader.split(":")[0]?.toLowerCase() || "";
+  if (host === "perpx.fi" || host.endsWith(".perpx.fi")) {
+    return ".perpx.fi";
+  }
+  return undefined;
+}
+
+function isSecureRequest(ctx: TrpcContext): boolean {
+  const forwardedProto = ctx.req.headers["x-forwarded-proto"];
+  if (typeof forwardedProto === "string") {
+    return forwardedProto.split(",")[0]?.trim() === "https";
+  }
+  return ctx.req.protocol === "https";
+}
+
+function getHeaderWalletIdentity(ctx: TrpcContext): string | null {
+  const raw = ctx.req.headers["x-perpx-rewards-wallet"];
+  if (typeof raw === "string") return normalizeWalletAddress(raw);
+  if (Array.isArray(raw) && raw.length > 0) return normalizeWalletAddress(raw[0]);
+  return null;
+}
+
+function getCookieWalletIdentity(ctx: TrpcContext): string | null {
+  const cookieHeader = typeof ctx.req.headers.cookie === "string" ? ctx.req.headers.cookie : "";
+  if (!cookieHeader) return null;
+  return normalizeWalletAddress(parseCookieValue(cookieHeader, REWARDS_IDENTITY_COOKIE));
+}
+
+function setRewardsWalletIdentity(ctx: TrpcContext, walletAddress: string) {
+  const hostHeader = typeof ctx.req.headers.host === "string" ? ctx.req.headers.host : undefined;
+  const cookieDomain = getRewardsCookieDomain(hostHeader);
+  ctx.res.cookie(REWARDS_IDENTITY_COOKIE, walletAddress, {
+    httpOnly: false,
+    secure: isSecureRequest(ctx),
+    sameSite: "lax",
+    path: "/",
+    maxAge: REWARDS_IDENTITY_MAX_AGE_MS,
+    ...(cookieDomain ? { domain: cookieDomain } : {}),
+  });
+}
+
+function clearRewardsWalletIdentity(ctx: TrpcContext) {
+  const hostHeader = typeof ctx.req.headers.host === "string" ? ctx.req.headers.host : undefined;
+  const cookieDomain = getRewardsCookieDomain(hostHeader);
+  ctx.res.clearCookie(REWARDS_IDENTITY_COOKIE, {
+    httpOnly: false,
+    secure: isSecureRequest(ctx),
+    sameSite: "lax",
+    path: "/",
+    ...(cookieDomain ? { domain: cookieDomain } : {}),
+  });
+}
+
+function resolveRewardsWalletAddress(ctx: TrpcContext, requestedWalletAddress: string): string {
+  const requested = normalizeWalletAddress(requestedWalletAddress) || requestedWalletAddress;
+  const headerWallet = getHeaderWalletIdentity(ctx);
+  const cookieWallet = getCookieWalletIdentity(ctx);
+  const resolved = headerWallet || cookieWallet || requested;
+
+  // Keep rewards/referral identity sticky in browser until explicit disconnect.
+  setRewardsWalletIdentity(ctx, resolved);
+  return resolved;
+}
 
 export const appRouter = router({
   // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
@@ -56,23 +147,29 @@ export const appRouter = router({
 
   // Rewards System API
   rewards: useMock ? mockRewardsRouter : router({
+    resetIdentity: publicProcedure.mutation(({ ctx }) => {
+      clearRewardsWalletIdentity(ctx);
+      return { success: true };
+    }),
+
     // Get or create wallet profile (called on wallet connect)
     getProfile: publicProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         chainType: z.enum(["evm", "tron", "solana"]),
       }))
-      .query(async ({ input }) => {
+      .query(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
         // Check Discord server membership if user is verified (auto-revoke if left)
-        await checkUserDiscordMembership(input.walletAddress);
+        await checkUserDiscordMembership(walletAddress);
 
         // Re-fetch profile after potential membership revocation
-        const profile = await getOrCreateWalletProfile(input.walletAddress, input.chainType);
+        const profile = await getOrCreateWalletProfile(walletAddress, input.chainType);
         if (!profile) {
           return null;
         }
         const dailyPostCompleted = profile.xConnected 
-          ? await isDailyPostCompleted(input.walletAddress)
+          ? await isDailyPostCompleted(walletAddress)
           : false;
         const todayUTC = getUTCDateString();
         
@@ -88,8 +185,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await claimConnectBonus(input.walletAddress);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await claimConnectBonus(walletAddress);
       }),
 
     // Connect X (Twitter) account
@@ -98,8 +196,9 @@ export const appRouter = router({
         walletAddress: z.string().min(1),
         xUsername: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await connectXAccount(input.walletAddress, input.xUsername);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await connectXAccount(walletAddress, input.xUsername);
       }),
 
     // Disconnect X account
@@ -107,8 +206,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await disconnectXAccount(input.walletAddress);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await disconnectXAccount(walletAddress);
       }),
 
     // Connect Discord account
@@ -117,16 +217,18 @@ export const appRouter = router({
         walletAddress: z.string().min(1),
         discordUsername: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await connectDiscordAccount(input.walletAddress, input.discordUsername);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await connectDiscordAccount(walletAddress, input.discordUsername);
       }),
 
     verifyDiscordServer: publicProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await verifyDiscordServer(input.walletAddress);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await verifyDiscordServer(walletAddress);
       }),
 
     // Disconnect Discord account
@@ -134,8 +236,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await disconnectDiscordAccount(input.walletAddress);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await disconnectDiscordAccount(walletAddress);
       }),
 
     // Complete daily post task
@@ -144,8 +247,9 @@ export const appRouter = router({
         walletAddress: z.string().min(1),
         tweetUrl: z.string().optional(),
       }))
-      .mutation(async ({ input }) => {
-        return await completeDailyPost(input.walletAddress, input.tweetUrl);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await completeDailyPost(walletAddress, input.tweetUrl);
       }),
 
     // Get points history
@@ -154,8 +258,9 @@ export const appRouter = router({
         walletAddress: z.string().min(1),
         limit: z.number().min(1).max(100).optional().default(50),
       }))
-      .query(async ({ input }) => {
-        return await getPointsHistory(input.walletAddress, input.limit);
+      .query(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await getPointsHistory(walletAddress, input.limit);
       }),
 
     // Check and revoke deleted tweets for a specific wallet
@@ -163,8 +268,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .mutation(async ({ input }) => {
-        return await checkAndRevokeDeletedTweets(input.walletAddress);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await checkAndRevokeDeletedTweets(walletAddress);
       }),
 
     // Get OAuth configuration status
@@ -195,8 +301,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .query(async ({ input }) => {
-        const profile = await getWalletProfile(input.walletAddress);
+      .query(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        const profile = await getWalletProfile(walletAddress);
         if (!profile) {
           return { canGenerate: false, hasCode: false, reason: "Profile not found" };
         }
@@ -224,8 +331,9 @@ export const appRouter = router({
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
-      .query(async ({ input }) => {
-        return await getReferralStats(input.walletAddress);
+      .query(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await getReferralStats(walletAddress);
       }),
 
     // Apply a referral code
@@ -234,8 +342,9 @@ export const appRouter = router({
         walletAddress: z.string().min(1),
         referralCode: z.string().min(1).max(16),
       }))
-      .mutation(async ({ input }) => {
-        return await applyReferralCode(input.walletAddress, input.referralCode);
+      .mutation(async ({ input, ctx }) => {
+        const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        return await applyReferralCode(walletAddress, input.referralCode);
       }),
 
     // Claim referral bonus (triggered when referred user completes qualifying action)
