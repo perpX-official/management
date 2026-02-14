@@ -7,6 +7,7 @@
 
 import { Router, Request, Response } from "express";
 import { connectXAccount, connectDiscordAccount, getWalletProfile } from "./db";
+import { auditLog, getTrackingId } from "./_core/observability";
 
 const router = Router();
 
@@ -154,14 +155,28 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
  * GET /api/social/x/auth?wallet=0x...
  */
 router.get("/x/auth", async (req: Request, res: Response) => {
+  const trackingId = getTrackingId(req, res);
   const walletAddress = req.query.wallet as string;
   const requestedOrigin = (req.query.redirect as string) || "";
   
   if (!walletAddress) {
+    auditLog({
+      trackingId,
+      event: "oauth.x.auth",
+      outcome: "blocked",
+      metadata: { reason: "wallet_missing" },
+    });
     return res.status(400).json({ error: "Wallet address required" });
   }
 
   if (!X_CLIENT_ID) {
+    auditLog({
+      trackingId,
+      event: "oauth.x.auth",
+      outcome: "error",
+      walletAddress,
+      metadata: { reason: "x_client_not_configured" },
+    });
     return res.status(500).json({ error: "X OAuth not configured. Please set X_CLIENT_ID and X_CLIENT_SECRET." });
   }
 
@@ -190,6 +205,13 @@ router.get("/x/auth", async (req: Request, res: Response) => {
   authUrl.searchParams.set("code_challenge", codeChallenge);
   authUrl.searchParams.set("code_challenge_method", "S256");
 
+  auditLog({
+    trackingId,
+    event: "oauth.x.auth",
+    outcome: "success",
+    walletAddress,
+    metadata: { redirectUri, frontendOrigin: pendingOAuthStates.get(state)?.frontendOrigin || null },
+  });
   res.redirect(authUrl.toString());
 });
 
@@ -198,19 +220,38 @@ router.get("/x/auth", async (req: Request, res: Response) => {
  * GET /api/social/x/callback?code=...&state=...
  */
 router.get("/x/callback", async (req: Request, res: Response) => {
+  const trackingId = getTrackingId(req, res);
   const { code, state, error } = req.query;
   const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
   if (error) {
+    auditLog({
+      trackingId,
+      event: "oauth.x.callback",
+      outcome: "blocked",
+      metadata: { reason: "provider_denied" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_denied" }));
   }
 
   if (!code || !state) {
+    auditLog({
+      trackingId,
+      event: "oauth.x.callback",
+      outcome: "blocked",
+      metadata: { reason: "missing_code_or_state" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_invalid" }));
   }
 
   const pendingState = pendingOAuthStates.get(state as string);
   if (!pendingState) {
+    auditLog({
+      trackingId,
+      event: "oauth.x.callback",
+      outcome: "blocked",
+      metadata: { reason: "state_expired_or_not_found" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_expired" }));
   }
 
@@ -238,6 +279,13 @@ router.get("/x/callback", async (req: Request, res: Response) => {
 
     if (!tokenResponse.ok) {
       console.error("X token exchange failed:", await tokenResponse.text());
+      auditLog({
+        trackingId,
+        event: "oauth.x.callback",
+        outcome: "error",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "token_exchange_failed" },
+      });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_token_failed" }));
     }
 
@@ -253,6 +301,13 @@ router.get("/x/callback", async (req: Request, res: Response) => {
 
     if (!userResponse.ok) {
       console.error("X user fetch failed:", await userResponse.text());
+      auditLog({
+        trackingId,
+        event: "oauth.x.callback",
+        outcome: "error",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "user_fetch_failed" },
+      });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_user_failed" }));
     }
 
@@ -263,12 +318,33 @@ router.get("/x/callback", async (req: Request, res: Response) => {
     const result = await connectXAccount(pendingState.walletAddress, xUsername);
 
     if (result.success) {
+      auditLog({
+        trackingId,
+        event: "oauth.x.callback",
+        outcome: "success",
+        walletAddress: pendingState.walletAddress,
+        metadata: { xUsername },
+      });
       res.redirect(makeRewardsRedirect(frontendOrigin, { success: "x_connected", username: xUsername }));
     } else {
+      auditLog({
+        trackingId,
+        event: "oauth.x.callback",
+        outcome: "warn",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "already_connected" },
+      });
       res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_already_connected" }));
     }
   } catch (err) {
     console.error("X OAuth error:", err);
+    auditLog({
+      trackingId,
+      event: "oauth.x.callback",
+      outcome: "error",
+      walletAddress: pendingState.walletAddress,
+      metadata: { reason: "exception" },
+    });
     res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_auth_error" }));
   }
 });
@@ -298,14 +374,28 @@ setInterval(() => {
  * GET /api/social/discord/auth?wallet=0x...
  */
 router.get("/discord/auth", async (req: Request, res: Response) => {
+  const trackingId = getTrackingId(req, res);
   const walletAddress = req.query.wallet as string;
   const requestedOrigin = (req.query.redirect as string) || "";
 
   if (!walletAddress) {
+    auditLog({
+      trackingId,
+      event: "oauth.discord.auth",
+      outcome: "blocked",
+      metadata: { reason: "wallet_missing" },
+    });
     return res.status(400).json({ error: "Wallet address required" });
   }
 
   if (!DISCORD_CLIENT_ID) {
+    auditLog({
+      trackingId,
+      event: "oauth.discord.auth",
+      outcome: "error",
+      walletAddress,
+      metadata: { reason: "discord_client_not_configured" },
+    });
     return res.status(500).json({ error: "Discord OAuth not configured. Please set DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET." });
   }
 
@@ -328,6 +418,13 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
   authUrl.searchParams.set("scope", "identify");
   authUrl.searchParams.set("state", state);
 
+  auditLog({
+    trackingId,
+    event: "oauth.discord.auth",
+    outcome: "success",
+    walletAddress,
+    metadata: { redirectUri, frontendOrigin: pendingDiscordStates.get(state)?.frontendOrigin || null },
+  });
   res.redirect(authUrl.toString());
 });
 
@@ -336,19 +433,38 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
  * GET /api/social/discord/callback?code=...&state=...
  */
 router.get("/discord/callback", async (req: Request, res: Response) => {
+  const trackingId = getTrackingId(req, res);
   const { code, state, error } = req.query;
   const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
   if (error) {
+    auditLog({
+      trackingId,
+      event: "oauth.discord.callback",
+      outcome: "blocked",
+      metadata: { reason: "provider_denied" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_denied" }));
   }
 
   if (!code || !state) {
+    auditLog({
+      trackingId,
+      event: "oauth.discord.callback",
+      outcome: "blocked",
+      metadata: { reason: "missing_code_or_state" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_invalid" }));
   }
 
   const pendingState = pendingDiscordStates.get(state as string);
   if (!pendingState) {
+    auditLog({
+      trackingId,
+      event: "oauth.discord.callback",
+      outcome: "blocked",
+      metadata: { reason: "state_expired_or_not_found" },
+    });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_expired" }));
   }
 
@@ -376,6 +492,13 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
 
     if (!tokenResponse.ok) {
       console.error("Discord token exchange failed:", await tokenResponse.text());
+      auditLog({
+        trackingId,
+        event: "oauth.discord.callback",
+        outcome: "error",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "token_exchange_failed" },
+      });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_token_failed" }));
     }
 
@@ -391,6 +514,13 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
 
     if (!userResponse.ok) {
       console.error("Discord user fetch failed:", await userResponse.text());
+      auditLog({
+        trackingId,
+        event: "oauth.discord.callback",
+        outcome: "error",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "user_fetch_failed" },
+      });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_user_failed" }));
     }
 
@@ -402,12 +532,33 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
     const result = await connectDiscordAccount(pendingState.walletAddress, discordUsername, discordId);
 
     if (result.success) {
+      auditLog({
+        trackingId,
+        event: "oauth.discord.callback",
+        outcome: "success",
+        walletAddress: pendingState.walletAddress,
+        metadata: { discordId, discordUsername },
+      });
       res.redirect(makeRewardsRedirect(frontendOrigin, { success: "discord_connected", username: discordUsername }));
     } else {
+      auditLog({
+        trackingId,
+        event: "oauth.discord.callback",
+        outcome: "warn",
+        walletAddress: pendingState.walletAddress,
+        metadata: { reason: "already_connected" },
+      });
       res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_already_connected" }));
     }
   } catch (err) {
     console.error("Discord OAuth error:", err);
+    auditLog({
+      trackingId,
+      event: "oauth.discord.callback",
+      outcome: "error",
+      walletAddress: pendingState.walletAddress,
+      metadata: { reason: "exception" },
+    });
     res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_auth_error" }));
   }
 });

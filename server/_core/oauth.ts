@@ -3,6 +3,7 @@ import type { Express, Request, Response } from "express";
 import * as db from "../db";
 import { getSessionCookieOptions } from "./cookies";
 import { sdk } from "./sdk";
+import { auditLog, getTrackingId } from "./observability";
 
 /**
  * Register wallet-based authentication routes
@@ -14,9 +15,16 @@ export function registerOAuthRoutes(app: Express) {
    * Called after frontend wallet signature verification
    */
   app.post("/api/auth/wallet", async (req: Request, res: Response) => {
+    const trackingId = getTrackingId(req, res);
     const { walletAddress, signature, message, chainType } = req.body;
 
     if (!walletAddress) {
+      auditLog({
+        trackingId,
+        event: "auth.wallet",
+        outcome: "blocked",
+        metadata: { reason: "wallet_missing" },
+      });
       res.status(400).json({ error: "walletAddress is required" });
       return;
     }
@@ -26,6 +34,13 @@ export function registerOAuthRoutes(app: Express) {
       if (signature && message) {
         const isValid = await sdk.verifyWalletSignature(message, signature, walletAddress);
         if (!isValid) {
+          auditLog({
+            trackingId,
+            event: "auth.wallet",
+            outcome: "blocked",
+            walletAddress,
+            metadata: { reason: "invalid_signature" },
+          });
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
@@ -47,6 +62,13 @@ export function registerOAuthRoutes(app: Express) {
       const chain = chainType || "evm";
       const profile = await db.getOrCreateWalletProfile(walletAddress, chain);
 
+      auditLog({
+        trackingId,
+        event: "auth.wallet",
+        outcome: "success",
+        walletAddress,
+        metadata: { chainType: chain, hasSignature: !!(signature && message) },
+      });
       res.json({ 
         success: true, 
         walletAddress,
@@ -54,6 +76,13 @@ export function registerOAuthRoutes(app: Express) {
       });
     } catch (error) {
       console.error("[Auth] Wallet authentication failed", error);
+      auditLog({
+        trackingId,
+        event: "auth.wallet",
+        outcome: "error",
+        walletAddress,
+        metadata: { reason: "exception" },
+      });
       res.status(500).json({ error: "Authentication failed" });
     }
   });
@@ -62,12 +91,23 @@ export function registerOAuthRoutes(app: Express) {
    * Logout endpoint
    */
   app.post("/api/auth/logout", async (req: Request, res: Response) => {
+    const trackingId = getTrackingId(req, res);
     try {
       const cookieOptions = getSessionCookieOptions(req);
       res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      auditLog({
+        trackingId,
+        event: "auth.logout",
+        outcome: "success",
+      });
       res.json({ success: true });
     } catch (error) {
       console.error("[Auth] Logout failed", error);
+      auditLog({
+        trackingId,
+        event: "auth.logout",
+        outcome: "error",
+      });
       res.status(500).json({ error: "Logout failed" });
     }
   });

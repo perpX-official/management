@@ -3,15 +3,19 @@ import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import net from "net";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "node:url";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import socialOAuthRouter from "../socialOAuth";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
-import { serveStatic, setupVite } from "./vite";
 import { cronCheckAllTweets } from "../db";
+import { auditLog, getOrCreateTrackingId } from "./observability";
 
 const useMockRewards = process.env.REWARDS_MOCK === "1";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -35,6 +39,31 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 async function startServer() {
   const app = express();
   const server = createServer(app);
+
+  app.use((req, res, next) => {
+    const trackingId = getOrCreateTrackingId(req, res);
+    const startedAt = Date.now();
+
+    res.on("finish", () => {
+      if (!req.originalUrl.startsWith("/api/")) return;
+      if (res.statusCode < 400) return;
+
+      auditLog({
+        trackingId,
+        event: "http.request",
+        outcome: res.statusCode >= 500 ? "error" : "blocked",
+        metadata: {
+          method: req.method,
+          path: req.originalUrl,
+          statusCode: res.statusCode,
+          durationMs: Date.now() - startedAt,
+          origin: req.headers.origin || null,
+        },
+      });
+    });
+
+    next();
+  });
 
   const allowedOrigins = (process.env.CORS_ORIGIN || "")
     .split(",")
@@ -71,6 +100,7 @@ async function startServer() {
   );
   // development mode uses Vite, production mode uses static files
   if (process.env.NODE_ENV === "development") {
+    const { setupVite } = await import("./vite");
     await setupVite(app, server);
   } else {
     serveStatic(app);
@@ -93,6 +123,20 @@ async function startServer() {
   } else {
     console.log("[Cron] Rewards mock mode enabled; skipping daily tweet check");
   }
+}
+
+function serveStatic(app: express.Express) {
+  const distPath = path.resolve(__dirname, "public");
+  if (!fs.existsSync(distPath)) {
+    console.error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+
+  app.use(express.static(distPath));
+  app.use("*", (_req, res) => {
+    res.sendFile(path.resolve(distPath, "index.html"));
+  });
 }
 
 /**

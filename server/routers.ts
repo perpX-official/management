@@ -3,6 +3,7 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import type { TrpcContext } from "./_core/context";
 import { publicProcedure, router } from "./_core/trpc";
+import { auditLog } from "./_core/observability";
 import { z } from "zod";
 import { mockRewardsRouter, mockReferralRouter, mockAdminRouter } from "./mockRouters";
 import {
@@ -125,11 +126,105 @@ function resolveRewardsWalletAddress(ctx: TrpcContext, requestedWalletAddress: s
   const headerWallet = getHeaderWalletIdentity(ctx);
   const cookieWallet = getCookieWalletIdentity(ctx);
   const resolved = headerWallet || cookieWallet || requested;
+  const source = headerWallet ? "header" : cookieWallet ? "cookie" : "request";
+
+  if (resolved !== requested || source !== "request") {
+    auditLog({
+      trackingId: ctx.trackingId,
+      event: "rewards.identity.resolve",
+      outcome: "success",
+      walletAddress: resolved,
+      metadata: {
+        source,
+        requestedWallet: requested,
+      },
+    });
+  }
 
   // Keep rewards/referral identity sticky in browser until explicit disconnect.
   setRewardsWalletIdentity(ctx, resolved);
   return resolved;
 }
+
+function getWalletFromInput(input: unknown): string | null {
+  if (!input || typeof input !== "object") return null;
+  const data = input as Record<string, unknown>;
+  if (typeof data.walletAddress === "string") {
+    return normalizeWalletAddress(data.walletAddress);
+  }
+  if (typeof data.referredWallet === "string") {
+    return normalizeWalletAddress(data.referredWallet);
+  }
+  return null;
+}
+
+const auditedRewardsProcedure = publicProcedure.use(async ({ ctx, path, type, input, next }) => {
+  const startedAt = Date.now();
+  const walletAddress = getWalletFromInput(input);
+  const shouldLog = type === "mutation" || path === "rewards.getProfile";
+
+  try {
+    const result = await next();
+    if (shouldLog) {
+      auditLog({
+        trackingId: ctx.trackingId,
+        event: `trpc.${path}`,
+        outcome: "success",
+        walletAddress,
+        metadata: {
+          type,
+          durationMs: Date.now() - startedAt,
+        },
+      });
+    }
+    return result;
+  } catch (error) {
+    auditLog({
+      trackingId: ctx.trackingId,
+      event: `trpc.${path}`,
+      outcome: "error",
+      walletAddress,
+      metadata: {
+        type,
+        durationMs: Date.now() - startedAt,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+    throw error;
+  }
+});
+
+const auditedReferralProcedure = publicProcedure.use(async ({ ctx, path, type, input, next }) => {
+  const startedAt = Date.now();
+  const walletAddress = getWalletFromInput(input);
+
+  try {
+    const result = await next();
+    if (type === "mutation") {
+      auditLog({
+        trackingId: ctx.trackingId,
+        event: `trpc.${path}`,
+        outcome: "success",
+        walletAddress,
+        metadata: { type, durationMs: Date.now() - startedAt },
+      });
+    }
+    return result;
+  } catch (error) {
+    auditLog({
+      trackingId: ctx.trackingId,
+      event: `trpc.${path}`,
+      outcome: "error",
+      walletAddress,
+      metadata: {
+        type,
+        durationMs: Date.now() - startedAt,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+    throw error;
+  }
+});
 
 export const appRouter = router({
   // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
@@ -147,13 +242,13 @@ export const appRouter = router({
 
   // Rewards System API
   rewards: useMock ? mockRewardsRouter : router({
-    resetIdentity: publicProcedure.mutation(({ ctx }) => {
+    resetIdentity: auditedRewardsProcedure.mutation(({ ctx }) => {
       clearRewardsWalletIdentity(ctx);
       return { success: true };
     }),
 
     // Get or create wallet profile (called on wallet connect)
-    getProfile: publicProcedure
+    getProfile: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         chainType: z.enum(["evm", "tron", "solana"]),
@@ -181,7 +276,7 @@ export const appRouter = router({
       }),
 
     // Claim connect bonus (300 points)
-    claimConnectBonus: publicProcedure
+    claimConnectBonus: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -191,7 +286,7 @@ export const appRouter = router({
       }),
 
     // Connect X (Twitter) account
-    connectX: publicProcedure
+    connectX: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         xUsername: z.string().min(1),
@@ -202,7 +297,7 @@ export const appRouter = router({
       }),
 
     // Disconnect X account
-    disconnectX: publicProcedure
+    disconnectX: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -212,7 +307,7 @@ export const appRouter = router({
       }),
 
     // Connect Discord account
-    connectDiscord: publicProcedure
+    connectDiscord: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         discordUsername: z.string().min(1),
@@ -222,7 +317,7 @@ export const appRouter = router({
         return await connectDiscordAccount(walletAddress, input.discordUsername);
       }),
 
-    verifyDiscordServer: publicProcedure
+    verifyDiscordServer: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -232,7 +327,7 @@ export const appRouter = router({
       }),
 
     // Disconnect Discord account
-    disconnectDiscord: publicProcedure
+    disconnectDiscord: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -242,7 +337,7 @@ export const appRouter = router({
       }),
 
     // Complete daily post task
-    completeDailyPost: publicProcedure
+    completeDailyPost: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         tweetUrl: z.string().optional(),
@@ -253,7 +348,7 @@ export const appRouter = router({
       }),
 
     // Get points history
-    getHistory: publicProcedure
+    getHistory: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         limit: z.number().min(1).max(100).optional().default(50),
@@ -264,7 +359,7 @@ export const appRouter = router({
       }),
 
     // Check and revoke deleted tweets for a specific wallet
-    checkTweets: publicProcedure
+    checkTweets: auditedRewardsProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -274,7 +369,7 @@ export const appRouter = router({
       }),
 
     // Get OAuth configuration status
-    getOAuthStatus: publicProcedure
+    getOAuthStatus: auditedRewardsProcedure
       .query(() => {
         const X_CLIENT_ID = process.env.X_CLIENT_ID || "";
         const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET || "";
@@ -297,7 +392,7 @@ export const appRouter = router({
   // Referral System API
   referral: useMock ? mockReferralRouter : router({
     // Check if user can generate referral code (requires X + Discord connection)
-    canGenerateCode: publicProcedure
+    canGenerateCode: auditedReferralProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -327,7 +422,7 @@ export const appRouter = router({
       }),
 
     // Get referral stats for a wallet
-    getStats: publicProcedure
+    getStats: auditedReferralProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
       }))
@@ -337,7 +432,7 @@ export const appRouter = router({
       }),
 
     // Apply a referral code
-    applyCode: publicProcedure
+    applyCode: auditedReferralProcedure
       .input(z.object({
         walletAddress: z.string().min(1),
         referralCode: z.string().min(1).max(16),
@@ -348,7 +443,7 @@ export const appRouter = router({
       }),
 
     // Claim referral bonus (triggered when referred user completes qualifying action)
-    claimBonus: publicProcedure
+    claimBonus: auditedReferralProcedure
       .input(z.object({
         referredWallet: z.string().min(1),
       }))
@@ -357,7 +452,7 @@ export const appRouter = router({
       }),
 
     // Get referral leaderboard
-    getLeaderboard: publicProcedure
+    getLeaderboard: auditedReferralProcedure
       .input(z.object({
         limit: z.number().min(1).max(100).optional().default(10),
       }))
@@ -366,7 +461,7 @@ export const appRouter = router({
       }),
 
     // Get tier info for a referral count
-    getTierInfo: publicProcedure
+    getTierInfo: auditedReferralProcedure
       .input(z.object({
         referralCount: z.number().min(0),
       }))
