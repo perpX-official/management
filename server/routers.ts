@@ -137,6 +137,7 @@ function resolveRewardsWalletAddress(ctx: TrpcContext, requestedWalletAddress: s
       metadata: {
         source,
         requestedWallet: requested,
+        ...ctx.requestAudit,
       },
     });
   }
@@ -174,6 +175,7 @@ const auditedRewardsProcedure = publicProcedure.use(async ({ ctx, path, type, in
         metadata: {
           type,
           durationMs: Date.now() - startedAt,
+          ...ctx.requestAudit,
         },
       });
     }
@@ -188,6 +190,7 @@ const auditedRewardsProcedure = publicProcedure.use(async ({ ctx, path, type, in
         type,
         durationMs: Date.now() - startedAt,
         message: error instanceof Error ? error.message : String(error),
+        ...ctx.requestAudit,
       },
     });
     throw error;
@@ -206,7 +209,11 @@ const auditedReferralProcedure = publicProcedure.use(async ({ ctx, path, type, i
         event: `trpc.${path}`,
         outcome: "success",
         walletAddress,
-        metadata: { type, durationMs: Date.now() - startedAt },
+        metadata: {
+          type,
+          durationMs: Date.now() - startedAt,
+          ...ctx.requestAudit,
+        },
       });
     }
     return result;
@@ -220,6 +227,7 @@ const auditedReferralProcedure = publicProcedure.use(async ({ ctx, path, type, i
         type,
         durationMs: Date.now() - startedAt,
         message: error instanceof Error ? error.message : String(error),
+        ...ctx.requestAudit,
       },
     });
     throw error;

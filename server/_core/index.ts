@@ -12,7 +12,7 @@ import socialOAuthRouter from "../socialOAuth";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { cronCheckAllTweets } from "../db";
-import { auditLog, getOrCreateTrackingId } from "./observability";
+import { auditLog, getOrCreateTrackingId, getRequestAuditContext } from "./observability";
 
 const useMockRewards = process.env.REWARDS_MOCK === "1";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +42,7 @@ async function startServer() {
 
   app.use((req, res, next) => {
     const trackingId = getOrCreateTrackingId(req, res);
+    const requestAudit = getRequestAuditContext(req);
     const startedAt = Date.now();
 
     res.on("finish", () => {
@@ -58,6 +59,7 @@ async function startServer() {
           statusCode: res.statusCode,
           durationMs: Date.now() - startedAt,
           origin: req.headers.origin || null,
+          ...requestAudit,
         },
       });
     });

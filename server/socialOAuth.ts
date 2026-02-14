@@ -7,7 +7,7 @@
 
 import { Router, Request, Response } from "express";
 import { connectXAccount, connectDiscordAccount, getWalletProfile } from "./db";
-import { auditLog, getTrackingId } from "./_core/observability";
+import { auditLog, getRequestAuditContext, getTrackingId } from "./_core/observability";
 
 const router = Router();
 
@@ -156,6 +156,7 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
  */
 router.get("/x/auth", async (req: Request, res: Response) => {
   const trackingId = getTrackingId(req, res);
+  const requestAudit = getRequestAuditContext(req);
   const walletAddress = req.query.wallet as string;
   const requestedOrigin = (req.query.redirect as string) || "";
   
@@ -164,7 +165,7 @@ router.get("/x/auth", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.x.auth",
       outcome: "blocked",
-      metadata: { reason: "wallet_missing" },
+      metadata: { reason: "wallet_missing", ...requestAudit },
     });
     return res.status(400).json({ error: "Wallet address required" });
   }
@@ -175,7 +176,7 @@ router.get("/x/auth", async (req: Request, res: Response) => {
       event: "oauth.x.auth",
       outcome: "error",
       walletAddress,
-      metadata: { reason: "x_client_not_configured" },
+      metadata: { reason: "x_client_not_configured", ...requestAudit },
     });
     return res.status(500).json({ error: "X OAuth not configured. Please set X_CLIENT_ID and X_CLIENT_SECRET." });
   }
@@ -210,7 +211,11 @@ router.get("/x/auth", async (req: Request, res: Response) => {
     event: "oauth.x.auth",
     outcome: "success",
     walletAddress,
-    metadata: { redirectUri, frontendOrigin: pendingOAuthStates.get(state)?.frontendOrigin || null },
+    metadata: {
+      redirectUri,
+      frontendOrigin: pendingOAuthStates.get(state)?.frontendOrigin || null,
+      ...requestAudit,
+    },
   });
   res.redirect(authUrl.toString());
 });
@@ -221,6 +226,7 @@ router.get("/x/auth", async (req: Request, res: Response) => {
  */
 router.get("/x/callback", async (req: Request, res: Response) => {
   const trackingId = getTrackingId(req, res);
+  const requestAudit = getRequestAuditContext(req);
   const { code, state, error } = req.query;
   const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
@@ -229,7 +235,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.x.callback",
       outcome: "blocked",
-      metadata: { reason: "provider_denied" },
+      metadata: { reason: "provider_denied", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_denied" }));
   }
@@ -239,7 +245,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.x.callback",
       outcome: "blocked",
-      metadata: { reason: "missing_code_or_state" },
+      metadata: { reason: "missing_code_or_state", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_invalid" }));
   }
@@ -250,7 +256,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.x.callback",
       outcome: "blocked",
-      metadata: { reason: "state_expired_or_not_found" },
+      metadata: { reason: "state_expired_or_not_found", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "x_auth_expired" }));
   }
@@ -284,7 +290,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
         event: "oauth.x.callback",
         outcome: "error",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "token_exchange_failed" },
+        metadata: { reason: "token_exchange_failed", ...requestAudit },
       });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_token_failed" }));
     }
@@ -306,7 +312,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
         event: "oauth.x.callback",
         outcome: "error",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "user_fetch_failed" },
+        metadata: { reason: "user_fetch_failed", ...requestAudit },
       });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_user_failed" }));
     }
@@ -323,7 +329,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
         event: "oauth.x.callback",
         outcome: "success",
         walletAddress: pendingState.walletAddress,
-        metadata: { xUsername },
+        metadata: { xUsername, ...requestAudit },
       });
       res.redirect(makeRewardsRedirect(frontendOrigin, { success: "x_connected", username: xUsername }));
     } else {
@@ -332,7 +338,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
         event: "oauth.x.callback",
         outcome: "warn",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "already_connected" },
+        metadata: { reason: "already_connected", ...requestAudit },
       });
       res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_already_connected" }));
     }
@@ -343,7 +349,7 @@ router.get("/x/callback", async (req: Request, res: Response) => {
       event: "oauth.x.callback",
       outcome: "error",
       walletAddress: pendingState.walletAddress,
-      metadata: { reason: "exception" },
+      metadata: { reason: "exception", ...requestAudit },
     });
     res.redirect(makeRewardsRedirect(frontendOrigin, { error: "x_auth_error" }));
   }
@@ -375,6 +381,7 @@ setInterval(() => {
  */
 router.get("/discord/auth", async (req: Request, res: Response) => {
   const trackingId = getTrackingId(req, res);
+  const requestAudit = getRequestAuditContext(req);
   const walletAddress = req.query.wallet as string;
   const requestedOrigin = (req.query.redirect as string) || "";
 
@@ -383,7 +390,7 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.discord.auth",
       outcome: "blocked",
-      metadata: { reason: "wallet_missing" },
+      metadata: { reason: "wallet_missing", ...requestAudit },
     });
     return res.status(400).json({ error: "Wallet address required" });
   }
@@ -394,7 +401,7 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
       event: "oauth.discord.auth",
       outcome: "error",
       walletAddress,
-      metadata: { reason: "discord_client_not_configured" },
+      metadata: { reason: "discord_client_not_configured", ...requestAudit },
     });
     return res.status(500).json({ error: "Discord OAuth not configured. Please set DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET." });
   }
@@ -423,7 +430,11 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
     event: "oauth.discord.auth",
     outcome: "success",
     walletAddress,
-    metadata: { redirectUri, frontendOrigin: pendingDiscordStates.get(state)?.frontendOrigin || null },
+    metadata: {
+      redirectUri,
+      frontendOrigin: pendingDiscordStates.get(state)?.frontendOrigin || null,
+      ...requestAudit,
+    },
   });
   res.redirect(authUrl.toString());
 });
@@ -434,6 +445,7 @@ router.get("/discord/auth", async (req: Request, res: Response) => {
  */
 router.get("/discord/callback", async (req: Request, res: Response) => {
   const trackingId = getTrackingId(req, res);
+  const requestAudit = getRequestAuditContext(req);
   const { code, state, error } = req.query;
   const defaultFrontendOrigin = resolveFrontendOrigin(req);
 
@@ -442,7 +454,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.discord.callback",
       outcome: "blocked",
-      metadata: { reason: "provider_denied" },
+      metadata: { reason: "provider_denied", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_denied" }));
   }
@@ -452,7 +464,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.discord.callback",
       outcome: "blocked",
-      metadata: { reason: "missing_code_or_state" },
+      metadata: { reason: "missing_code_or_state", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_invalid" }));
   }
@@ -463,7 +475,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
       trackingId,
       event: "oauth.discord.callback",
       outcome: "blocked",
-      metadata: { reason: "state_expired_or_not_found" },
+      metadata: { reason: "state_expired_or_not_found", ...requestAudit },
     });
     return res.redirect(makeRewardsRedirect(defaultFrontendOrigin, { error: "discord_auth_expired" }));
   }
@@ -497,7 +509,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
         event: "oauth.discord.callback",
         outcome: "error",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "token_exchange_failed" },
+        metadata: { reason: "token_exchange_failed", ...requestAudit },
       });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_token_failed" }));
     }
@@ -519,7 +531,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
         event: "oauth.discord.callback",
         outcome: "error",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "user_fetch_failed" },
+        metadata: { reason: "user_fetch_failed", ...requestAudit },
       });
       return res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_user_failed" }));
     }
@@ -537,7 +549,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
         event: "oauth.discord.callback",
         outcome: "success",
         walletAddress: pendingState.walletAddress,
-        metadata: { discordId, discordUsername },
+        metadata: { discordId, discordUsername, ...requestAudit },
       });
       res.redirect(makeRewardsRedirect(frontendOrigin, { success: "discord_connected", username: discordUsername }));
     } else {
@@ -546,7 +558,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
         event: "oauth.discord.callback",
         outcome: "warn",
         walletAddress: pendingState.walletAddress,
-        metadata: { reason: "already_connected" },
+        metadata: { reason: "already_connected", ...requestAudit },
       });
       res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_already_connected" }));
     }
@@ -557,7 +569,7 @@ router.get("/discord/callback", async (req: Request, res: Response) => {
       event: "oauth.discord.callback",
       outcome: "error",
       walletAddress: pendingState.walletAddress,
-      metadata: { reason: "exception" },
+      metadata: { reason: "exception", ...requestAudit },
     });
     res.redirect(makeRewardsRedirect(frontendOrigin, { error: "discord_auth_error" }));
   }

@@ -5,6 +5,12 @@ const TRACKING_ID_HEADER = "x-perpx-tracking-id";
 
 export type AuditOutcome = "success" | "error" | "blocked" | "warn";
 
+export type RequestAuditContext = {
+  clientIpHash: string | null;
+  clientUaHash: string | null;
+  clientFingerprint: string | null;
+};
+
 type AuditEntry = {
   trackingId: string;
   event: string;
@@ -36,6 +42,47 @@ function generateTrackingId(): string {
       ? crypto.randomUUID()
       : crypto.randomBytes(16).toString("hex");
   return randomId.replace(/-/g, "");
+}
+
+function hashForAudit(value: string | null): string | null {
+  if (!value) return null;
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function normalizeIp(req: Request): string | null {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  let raw = "";
+  if (typeof forwardedFor === "string") {
+    raw = forwardedFor.split(",")[0]?.trim() || "";
+  } else if (Array.isArray(forwardedFor) && forwardedFor.length > 0) {
+    raw = forwardedFor[0]?.split(",")[0]?.trim() || "";
+  }
+  if (!raw) raw = req.ip || req.socket?.remoteAddress || "";
+  raw = raw.trim();
+  return raw.length > 0 ? raw : null;
+}
+
+function normalizeUserAgent(req: Request): string | null {
+  const uaHeader = req.headers["user-agent"];
+  const value = Array.isArray(uaHeader) ? uaHeader[0] : uaHeader;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+export function getRequestAuditContext(req: Request): RequestAuditContext {
+  const clientIpHash = hashForAudit(normalizeIp(req));
+  const clientUaHash = hashForAudit(normalizeUserAgent(req));
+  const clientFingerprint =
+    clientIpHash && clientUaHash
+      ? `${clientIpHash}:${clientUaHash}`
+      : clientIpHash || clientUaHash || null;
+
+  return {
+    clientIpHash,
+    clientUaHash,
+    clientFingerprint,
+  };
 }
 
 export function getOrCreateTrackingId(req: Request, res: Response): string {

@@ -3,7 +3,7 @@ import type { Express, Request, Response } from "express";
 import * as db from "../db";
 import { getSessionCookieOptions } from "./cookies";
 import { sdk } from "./sdk";
-import { auditLog, getTrackingId } from "./observability";
+import { auditLog, getRequestAuditContext, getTrackingId } from "./observability";
 
 /**
  * Register wallet-based authentication routes
@@ -16,6 +16,7 @@ export function registerOAuthRoutes(app: Express) {
    */
   app.post("/api/auth/wallet", async (req: Request, res: Response) => {
     const trackingId = getTrackingId(req, res);
+    const requestAudit = getRequestAuditContext(req);
     const { walletAddress, signature, message, chainType } = req.body;
 
     if (!walletAddress) {
@@ -23,7 +24,7 @@ export function registerOAuthRoutes(app: Express) {
         trackingId,
         event: "auth.wallet",
         outcome: "blocked",
-        metadata: { reason: "wallet_missing" },
+        metadata: { reason: "wallet_missing", ...requestAudit },
       });
       res.status(400).json({ error: "walletAddress is required" });
       return;
@@ -39,7 +40,7 @@ export function registerOAuthRoutes(app: Express) {
             event: "auth.wallet",
             outcome: "blocked",
             walletAddress,
-            metadata: { reason: "invalid_signature" },
+            metadata: { reason: "invalid_signature", ...requestAudit },
           });
           res.status(401).json({ error: "Invalid signature" });
           return;
@@ -67,7 +68,11 @@ export function registerOAuthRoutes(app: Express) {
         event: "auth.wallet",
         outcome: "success",
         walletAddress,
-        metadata: { chainType: chain, hasSignature: !!(signature && message) },
+        metadata: {
+          chainType: chain,
+          hasSignature: !!(signature && message),
+          ...requestAudit,
+        },
       });
       res.json({ 
         success: true, 
@@ -81,7 +86,7 @@ export function registerOAuthRoutes(app: Express) {
         event: "auth.wallet",
         outcome: "error",
         walletAddress,
-        metadata: { reason: "exception" },
+        metadata: { reason: "exception", ...requestAudit },
       });
       res.status(500).json({ error: "Authentication failed" });
     }
@@ -92,6 +97,7 @@ export function registerOAuthRoutes(app: Express) {
    */
   app.post("/api/auth/logout", async (req: Request, res: Response) => {
     const trackingId = getTrackingId(req, res);
+    const requestAudit = getRequestAuditContext(req);
     try {
       const cookieOptions = getSessionCookieOptions(req);
       res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
@@ -99,6 +105,7 @@ export function registerOAuthRoutes(app: Express) {
         trackingId,
         event: "auth.logout",
         outcome: "success",
+        metadata: requestAudit,
       });
       res.json({ success: true });
     } catch (error) {
@@ -107,6 +114,7 @@ export function registerOAuthRoutes(app: Express) {
         trackingId,
         event: "auth.logout",
         outcome: "error",
+        metadata: requestAudit,
       });
       res.status(500).json({ error: "Logout failed" });
     }
