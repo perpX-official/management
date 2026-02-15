@@ -38,6 +38,7 @@ import {
   checkUserDiscordMembership,
   checkAndRevokeDeletedTweets,
   cronCheckAllTweets,
+  inferChainTypeFromWalletAddress,
 } from "./db";
 
 const useMock = process.env.REWARDS_MOCK === "1";
@@ -273,11 +274,12 @@ export const appRouter = router({
       }))
       .query(async ({ input, ctx }) => {
         const walletAddress = resolveRewardsWalletAddress(ctx, input.walletAddress);
+        const identityChainType = inferChainTypeFromWalletAddress(walletAddress) || input.chainType;
         // Check Discord server membership if user is verified (auto-revoke if left)
         await checkUserDiscordMembership(walletAddress);
 
         // Re-fetch profile after potential membership revocation
-        const profile = await getOrCreateWalletProfile(walletAddress, input.chainType);
+        const profile = await getOrCreateWalletProfile(walletAddress, identityChainType);
         if (!profile) {
           return null;
         }

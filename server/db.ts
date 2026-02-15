@@ -95,6 +95,18 @@ export async function getUserByWallet(walletAddress: string) {
 // Wallet Profile Functions (Rewards System)
 // ============================================
 
+export type ChainType = "evm" | "tron" | "solana";
+
+export function inferChainTypeFromWalletAddress(walletAddress: string): ChainType | null {
+  const value = walletAddress.trim();
+  if (/^0x[a-fA-F0-9]{40}$/.test(value)) return "evm";
+  // Common Tron Base58Check addresses start with "T" and are 34 chars.
+  if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(value)) return "tron";
+  // Solana public keys are base58 and typically 32-44 chars.
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) return "solana";
+  return null;
+}
+
 export async function getOrCreateWalletProfile(walletAddress: string, chainType: string = "evm") {
   const db = await getDb();
   if (!db) {
@@ -105,14 +117,23 @@ export async function getOrCreateWalletProfile(walletAddress: string, chainType:
   const existing = await db.select().from(walletProfiles).where(eq(walletProfiles.walletAddress, walletAddress)).limit(1);
   
   if (existing.length > 0) {
-    return existing[0];
+    const profile = existing[0];
+    const inferred = inferChainTypeFromWalletAddress(walletAddress) || (chainType as ChainType);
+    if (profile.chainType !== inferred) {
+      await db.update(walletProfiles)
+        .set({ chainType: inferred, updatedAt: new Date() })
+        .where(eq(walletProfiles.walletAddress, walletAddress));
+      return getWalletProfile(walletAddress);
+    }
+    return profile;
   }
 
   // Create new profile without referral code
   // Referral code will be generated when X + Discord are both connected
+  const inferred = inferChainTypeFromWalletAddress(walletAddress) || (chainType as ChainType);
   await db.insert(walletProfiles).values({
     walletAddress,
-    chainType,
+    chainType: inferred,
     totalPoints: 0,
     connectBonusClaimed: false,
     xConnected: false,
