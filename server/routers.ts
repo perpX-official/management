@@ -99,10 +99,15 @@ function getCookieWalletIdentity(ctx: TrpcContext): string | null {
 function setRewardsWalletIdentity(ctx: TrpcContext, walletAddress: string) {
   const hostHeader = typeof ctx.req.headers.host === "string" ? ctx.req.headers.host : undefined;
   const cookieDomain = getRewardsCookieDomain(hostHeader);
+  const secure = isSecureRequest(ctx);
+  // If the frontend is on a different site (e.g. Vercel preview domain),
+  // SameSite=Lax cookies won't be sent for XHR/fetch. Use SameSite=None on HTTPS
+  // so the rewards identity stays sticky even across cross-site requests.
+  const sameSite = secure ? ("none" as const) : ("lax" as const);
   ctx.res.cookie(REWARDS_IDENTITY_COOKIE, walletAddress, {
     httpOnly: false,
-    secure: isSecureRequest(ctx),
-    sameSite: "lax",
+    secure,
+    sameSite,
     path: "/",
     maxAge: REWARDS_IDENTITY_MAX_AGE_MS,
     ...(cookieDomain ? { domain: cookieDomain } : {}),
@@ -112,10 +117,12 @@ function setRewardsWalletIdentity(ctx: TrpcContext, walletAddress: string) {
 function clearRewardsWalletIdentity(ctx: TrpcContext) {
   const hostHeader = typeof ctx.req.headers.host === "string" ? ctx.req.headers.host : undefined;
   const cookieDomain = getRewardsCookieDomain(hostHeader);
+  const secure = isSecureRequest(ctx);
+  const sameSite = secure ? ("none" as const) : ("lax" as const);
   ctx.res.clearCookie(REWARDS_IDENTITY_COOKIE, {
     httpOnly: false,
-    secure: isSecureRequest(ctx),
-    sameSite: "lax",
+    secure,
+    sameSite,
     path: "/",
     ...(cookieDomain ? { domain: cookieDomain } : {}),
   });
@@ -123,10 +130,13 @@ function clearRewardsWalletIdentity(ctx: TrpcContext) {
 
 function resolveRewardsWalletAddress(ctx: TrpcContext, requestedWalletAddress: string): string {
   const requested = normalizeWalletAddress(requestedWalletAddress) || requestedWalletAddress;
-  const headerWallet = getHeaderWalletIdentity(ctx);
   const cookieWallet = getCookieWalletIdentity(ctx);
-  const resolved = headerWallet || cookieWallet || requested;
-  const source = headerWallet ? "header" : cookieWallet ? "cookie" : "request";
+  // IMPORTANT: Once a rewards identity cookie exists, do NOT let the header override it.
+  // Otherwise a wallet switch (which updates the header) would create a brand new wallet_profile
+  // and effectively "split" a single user into multiple rows in admin.
+  const headerWallet = cookieWallet ? null : getHeaderWalletIdentity(ctx);
+  const resolved = cookieWallet || headerWallet || requested;
+  const source = cookieWallet ? "cookie" : headerWallet ? "header" : "request";
 
   if (resolved !== requested || source !== "request") {
     auditLog({
